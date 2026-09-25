@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Crypto Anomaly Monitor</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <style>
+    body { background-color: #f8f9fa; padding-top: 56px; }
+    .page-wrap { max-width: 900px; margin: 0 auto; padding: 2rem 1rem 4rem; }
+    .navbar-brand { font-weight: 600; }
+    .return-negative { color: #a94442; background-color: #fbeaea; }
+    .return-positive { color: #2e7d4f; background-color: #eaf6ef; }
+    .table td, .table th { vertical-align: middle; }
+    #resultsCard, #chartCard, #loadingState, #errorAlert { display: none; }
+    .summary-line { font-size: 0.95rem; color: #495057; }
+    .form-note { font-size: 0.85rem; }
+    #priceChart { max-height: 320px; }
+  </style>
+</head>
+<body>
+
+  <nav class="navbar navbar-light bg-white border-bottom fixed-top">
+    <div class="container" style="max-width: 900px;">
+      <span class="navbar-brand mb-0">Crypto Anomaly Monitor</span>
+      <a class="text-muted small" href="https://github.com" target="_blank" rel="noopener noreferrer">GitHub</a>
+    </div>
+  </nav>
+
+  <div class="page-wrap">
+
+    <div class="card mb-4">
+      <div class="card-header bg-white">
+        <strong>Control Panel</strong>
+      </div>
+      <div class="card-body">
+        <form id="analyzeForm" class="row g-2 align-items-center">
+          <div class="col-sm-8">
+            <label for="coinInput" class="visually-hidden">Coin ID</label>
+            <input type="text" class="form-control" id="coinInput" placeholder="CoinGecko coin id, e.g. bitcoin" value="bitcoin" maxlength="40" required>
+          </div>
+          <div class="col-sm-4">
+            <button type="submit" class="btn btn-primary w-100" id="runBtn">Run Anomaly Detection</button>
+          </div>
+        </form>
+        <div class="form-text form-note mt-2">v1 — trained on daily percentage returns (Isolation Forest), data via CoinGecko</div>
+      </div>
+    </div>
+
+    <div id="loadingState" class="d-flex align-items-center gap-2 mb-4 text-muted">
+      <div class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></div>
+      <span>Generates returns &amp; trains model — takes ~1-2s</span>
+    </div>
+
+    <div id="errorAlert" class="alert alert-danger" role="alert"></div>
+
+    <div class="card mb-4" id="chartCard">
+      <div class="card-header bg-white">
+        <strong>Price Timeline</strong>
+      </div>
+      <div class="card-body">
+        <canvas id="priceChart"></canvas>
+      </div>
+    </div>
+
+    <div class="card" id="resultsCard">
+      <div class="card-header bg-white d-flex justify-content-between align-items-center">
+        <strong>Results</strong>
+        <span class="summary-line" id="summaryLine"></span>
+      </div>
+      <div class="card-body p-0">
+        <table class="table table-sm mb-0">
+          <thead>
+            <tr>
+              <th scope="col">Date</th>
+              <th scope="col">Return (%)</th>
+              <th scope="col">Price (USD)</th>
+            </tr>
+          </thead>
+          <tbody id="resultsBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+  </div>
+
+  <script>
+    const form = document.getElementById('analyzeForm');
+    const runBtn = document.getElementById('runBtn');
+    const loadingState = document.getElementById('loadingState');
+    const errorAlert = document.getElementById('errorAlert');
+    const chartCard = document.getElementById('chartCard');
+    const resultsCard = document.getElementById('resultsCard');
+    const resultsBody = document.getElementById('resultsBody');
+    const summaryLine = document.getElementById('summaryLine');
+
+    let priceChart = null; // holds the Chart.js instance so we can destroy/redraw on re-run
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+
+      const coinId = document.getElementById('coinInput').value.trim().toLowerCase();
+      if (!coinId) return;
+
+      errorAlert.style.display = 'none';
+      chartCard.style.display = 'none';
+      resultsCard.style.display = 'none';
+      loadingState.style.display = 'flex';
+      runBtn.disabled = true;
+
+      try {
+        // train first, then pull anomalies + price history off the freshly trained model
+        const analyzeRes = await fetch(`/analyze/${coinId}`, { method: 'POST' });
+        if (!analyzeRes.ok) {
+          const err = await analyzeRes.json().catch(() => ({}));
+          throw new Error(err.detail || `analyze failed (${analyzeRes.status})`);
+        }
+        const analyzeData = await analyzeRes.json();
+
+        const anomalyRes = await fetch(`/anomalies/${coinId}`);
+        if (!anomalyRes.ok) {
+          const err = await anomalyRes.json().catch(() => ({}));
+          throw new Error(err.detail || `anomalies failed (${anomalyRes.status})`);
+        }
+        const anomalyData = await anomalyRes.json();
+
+        renderChart(anomalyData);
+        renderResults(analyzeData, anomalyData);
+      } catch (err) {
+        errorAlert.textContent = err.message || 'something went wrong, check the server logs';
+        errorAlert.style.display = 'block';
+      } finally {
+        loadingState.style.display = 'none';
+        runBtn.disabled = false;
+      }
+    });
+
+    function renderChart(anomalyData) {
+      const history = anomalyData.price_history || [];
+      const anomalyDates = new Set((anomalyData.anomalies || []).map(a => a.date));
+
+      const labels = history.map(p => p.date);
+      const prices = history.map(p => p.price);
+
+      // red dots only land on anomaly dates, everything else stays basically invisible
+      const pointColors = history.map(p => anomalyDates.has(p.date) ? '#c0392b' : 'rgba(0,0,0,0)');
+      const pointRadii = history.map(p => anomalyDates.has(p.date) ? 4 : 0);
+
+      if (priceChart) {
+        priceChart.destroy();
+      }
+
+      const ctx = document.getElementById('priceChart');
+      priceChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: labels,
+          datasets: [{
+            label: 'Price (USD)',
+            data: prices,
+            borderColor: '#495057',
+            borderWidth: 1.5,
+            pointBackgroundColor: pointColors,
+            pointBorderColor: pointColors,
+            pointRadius: pointRadii,
+            pointHoverRadius: 5,
+            tension: 0.1,
+          }]
+        },
+        options: {
+          responsive: true,
+          plugins: { legend: { display: false } },
+          scales: {
+            x: { ticks: { maxTicksLimit: 10 } },
+            y: { ticks: { callback: v => '$' + v } }
+          }
+        }
+      });
+
+      chartCard.style.display = 'block';
+    }
+
+    function renderResults(analyzeData, anomalyData) {
+      const totalRows = analyzeData.rows_trained;
+      const anomalies = anomalyData.anomalies || [];
+
+      summaryLine.textContent = `${anomalies.length} anomalies detected out of ${totalRows} trading days`;
+
+      resultsBody.innerHTML = '';
+      if (anomalies.length === 0) {
+        resultsBody.innerHTML = '<tr><td colspan="3" class="text-muted text-center py-3">No anomalies found for this coin.</td></tr>';
+      } else {
+        anomalies.forEach(item => {
+          const row = document.createElement('tr');
+          const rowClass = item.return_pct < 0 ? 'return-negative' : 'return-positive';
+          row.innerHTML = `
+            <td>${item.date}</td>
+            <td class="${rowClass}">${item.return_pct.toFixed(2)}%</td>
+            <td>$${item.price.toLocaleString()}</td>
+          `;
+          resultsBody.appendChild(row);
+        });
+      }
+
+      resultsCard.style.display = 'block';
+    }
+  </script>
+
+</body>
+</html>
