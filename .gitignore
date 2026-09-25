@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+requests.db
+models/
+venv/
+.env
