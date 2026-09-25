@@ -1,5 +1,6 @@
 import os
 import time
+from functools import lru_cache
 import joblib
 import pandas as pd
 import requests
@@ -15,6 +16,7 @@ def _model_path(coin_id: str) -> str:
     return os.path.join(MODEL_DIR, f"{coin_id}_iforest.joblib")
 
 
+@lru_cache(maxsize=10)
 def fetch_ohlcv(coin_id: str, days: int = 365) -> pd.DataFrame:
     # retry needed — coingecko's free tier rate-limits pretty aggressively (429s)
     url = f"{COINGECKO_BASE}/coins/{coin_id}/market_chart"
